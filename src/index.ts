@@ -220,9 +220,10 @@ export default function (pi: ExtensionAPI) {
     const producer = ["--source", "pi", "--external-id", sessionId];
     const createArgs = ["thread", "create", ...producer, "--organization", organization.id, "--visibility", visibility];
 
-    // `thread create` returns the same thread for the same producer IDs, so a retried share is safe.
-    const { thread_id: thread } = await delta.run(ThreadCreated, createArgs);
+    // The worktree comes first so a checkout Delta can't use fails before any thread exists. `thread create` returns
+    // the same thread for the same producer IDs, so a retried share is safe.
     const worktreeReference = await worktreeFor(delta, checkout);
+    const { thread_id: thread } = await delta.run(ThreadCreated, createArgs);
 
     await delta.run(AnyObject, ["worktree", "attach", worktreeReference, "--thread", thread]);
     if (emails.length) await delta.run(AnyObject, ["thread", "invite", thread, "--", ...emails]);
@@ -263,21 +264,22 @@ export default function (pi: ExtensionAPI) {
     if (!locator) return notify("Usage: /delta join <share link or thread ID>", "warning");
     if (active) return notify("This session is already in Delta. Start a new session with /new to join another thread.", "warning");
 
+    // The session ID is chosen up front because `thread status` needs the producer's ID before anything is mounted.
+    const sessionId = randomUUID();
     const delta = await resolveCli();
-    const status = await delta.run(ThreadStatus, ["thread", "status", locator]);
+    const status = await delta.run(ThreadStatus, ["thread", "status", locator, "--source", "pi", "--external-id", sessionId]);
     if (status.access.state !== "granted") return notify("You don't have access to that thread. Ask its owner to share it with you.", "error");
 
-    const owner = randomUUID();
-    const membership = { kind: "joined", locator, owner, directory: "" } as const;
+    const membership = { kind: "joined", locator, owner: sessionId, directory: "" } as const;
     const url = status.url ?? undefined;
 
     notify("Mounting the thread's files...");
 
     const thread = status.thread_id;
-    const mount = await startMount(delta, { sessionId: owner, thread, membership, next: 1, pending: [], injected: {} });
+    const mount = await startMount(delta, { sessionId, thread, membership, next: 1, pending: [], injected: {} });
     const { directory } = await mount.ready;
 
-    const session = SessionManager.create(directory);
+    const session = SessionManager.create(directory, undefined, { id: sessionId });
     session.appendCustomMessageEntry("delta-joined", `[Delta] Joined thread ${url ?? thread}. Files are in ${directory}.`, true);
 
     const file = session.getSessionFile();
@@ -285,7 +287,6 @@ export default function (pi: ExtensionAPI) {
 
     writeFileSync(file, [session.getHeader(), ...session.getEntries()].map((entry) => `${JSON.stringify(entry)}\n`).join(""));
 
-    const sessionId = session.getSessionId();
     const joined = { ...membership, directory };
     saveBinding({ sessionId, thread, membership: joined, url, next: 1, pending: [], injected: {} });
     handoff.set(sessionId, mount);
